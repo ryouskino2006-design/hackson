@@ -1,58 +1,76 @@
 import processing.serial.*;
-Serial port; // シリアルポート
+Serial port; 
 import ddf.minim.*;
 import ddf.minim.ugens.*;
 
-Waveform currentWaveform;
 Minim minim;
 AudioOutput out;
-int melodyLength = 29;
-String[] melody = new String[melodyLength];
-float[] duration = new float[melodyLength];
-float[] startTime = new float[melodyLength];
-float[] amplitude = new float[melodyLength];
+
+// トランペットのエンベロープ設定
+float attackTime = 0.145f; // 145ms
+float releaseTime= 0.030f; // 30ms
+
+// 解像度4096のWavetableを用いた倍音合成用ウェーブ
+Waveform lowWave   = WavetableGenerator.gen10(4096, new float[] { 1.0f, 0.72f, 0.5f, 0.3f, 0.1f });
+Waveform midWave   = WavetableGenerator.gen10(4096, new float[] { 1.0f, 0.43f, 0.3f, 0.15f, 0.05f });
+Waveform highWave  = WavetableGenerator.gen10(4096, new float[] { 1.0f, 0.028f, 0.01f });
 
 void setup(){
   size (512 , 200);
   minim = new Minim(this);
   out = minim.getLineOut();
-  out.setTempo(120);
   
-  // トランペット特有の芯のある明るい響きを再現する倍音
-  currentWaveform = WavetableGenerator.gen10(4096, new float[] { 1.0f, 1.0f, 0.7f, 0.5f, 0.3f, 0.2f, 0.1f, 0.05f });
-  
-  port = new Serial(this, "/dev/cu.usbmodem34B7DA64C6002", 921600);
+  // シリアルポート設定（※ポート名はご自身の環境に合わせてください）
+  port = new Serial(this, "/dev/cu.usbmodem34B7DA636B9C2", 921600);
   port.clear();
-  port.bufferUntil('\n');
-  delay(1000); 
-  port.write('A'); 
-  println("Arduinoに送信リクエストを送りました...");
+  port.bufferUntil('\n'); 
+  
+  println("赤外線同期によるリアルタイム自動演奏を待機中...");
 }
 
 void draw() {
   background(0);
 }
 
+// Arduinoからデータが届いた瞬間に自動で呼び出されるイベント
 void serialEvent(Serial p) {
   String inString = p.readStringUntil('\n');
   if(inString != null){
-    println("受信した生データ: " + inString);
-    String[] notes = split(trim(inString), ',');
-    for(int i=0; i<notes.length; i++){
-      String[] data = split(notes[i], ':');
-      if(data.length == 4){
-        melody[i] = data[0];
-        duration[i] = float(data[1]);
-        startTime[i] = float(data[2]);
-        amplitude[i] = float(data[3]);
+    inString = trim(inString);
+    println("受信したデータ: " + inString);
+    
+    String[] notes = split(inString, ',');
+    if(notes.length > 0 && !notes[0].equals("")){
+      String[] data = split(notes[0], ':');
+      
+      // 要素数が 3（音名:開始時間:音量）に一致しているかチェック
+      if(data.length >= 3){
+        String noteName = data[0];    
+        float amp = float(data[2]);       
+        
+        if (noteName != null && !noteName.equals("")) {
+          float hz = Frequency.ofPitch(noteName).asHz();
+          
+          // 周波数に応じた倍音ウェーブの自動選択
+          Waveform selectedWave = midWave; 
+          if (hz < 550) {
+            selectedWave = lowWave;        
+          } else if (hz > 900) {
+            selectedWave = highWave;       
+          }
+          
+          // ★届いた瞬間（0.0f秒後）に、固定長（0.4秒）で即座に演奏をトリガー
+          out.playNote(0.0f, 0.4f, new Trumpet(hz, amp, selectedWave));
+        }
       }
     }
   }
 }
 
+// --- トランペットクラス（ノイズ対策版） ---
 class Trumpet implements Instrument {
   Oscil wave;
-  Line ampEnv; // 音量をコントロールする直線
+  Line ampEnv; 
   Oscil vib;      
   Summer freqSum; 
   Constant baseFreq; 
@@ -63,7 +81,7 @@ class Trumpet implements Instrument {
     
     freqSum = new Summer();
     baseFreq = new Constant(frequency);
-    vib = new Oscil(5.5f, 3.0f, Waves.SINE); 
+    vib = new Oscil(5.5f, 3.0f, Waves.SINE); // 5Hz付近（5.5Hz）ビブラート
 
     baseFreq.patch(freqSum);
     vib.patch(freqSum);
@@ -71,48 +89,19 @@ class Trumpet implements Instrument {
     wave = new Oscil(frequency, 0, wf);
     freqSum.patch(wave.frequency);
     
-    // Lineを初期化して、waveのamplitude（音量）にパッチする
     ampEnv = new Line(); 
     ampEnv.patch(wave.amplitude);
   }
 
   void noteOn(float duration) {
-    // 音が鳴るとき：0.01秒かけて無音(0)から指定の音量(maxAmp)へ立ち上げる
-    ampEnv.activate(0.01f, 0, maxAmp);
+    ampEnv.activate(attackTime, 0, maxAmp);
     wave.patch(out);
   }
 
   void noteOff() {
-    // 音が消えるとき：0.03秒（30ミリ秒）かけて、現在の音量から0へ滑らかに落とす
-    ampEnv.activate(0.03f, maxAmp, 0);
+    // 30ms（releaseTime）かけて滑らかに音量を0へ落とす
+    ampEnv.activate(releaseTime, maxAmp, 0);
     
-    // 【重要】音量が0に落ちきるのを少しだけ待ってから、スピーカーから切断する
-    // これにより「ブチッ」という不連続な雑音が完全に消えます
-    delay(30); 
-    wave.unpatch(out);
-  }
-}
-// ==========================================
-// 演奏用の関数（クラスの外側）
-// ==========================================
-void playSong() {
-  out.pauseNotes();
-  boolean hasData = false;
-  for (int i = 0; i < melody.length; i++) {
-    if (melody[i] != null) { 
-      out.playNote(startTime[i], duration[i],
-        new Trumpet(Frequency.ofPitch(melody[i]).asHz(), amplitude[i], currentWaveform));
-      hasData = true;
-    }
-  }
-  if (!hasData) {
-    println("まだデータが届いていないようです。Arduinoを確認してください。");
-  }
-  out.resumeNotes();
-}
- 
-void keyPressed() {
-  if (key == 'p') {
-    playSong();
+    // ★手動のdelayや強引なunpatchを無くすことで、Minimに安全にフェードアウトさせ、ノイズを完全解消
   }
 }
